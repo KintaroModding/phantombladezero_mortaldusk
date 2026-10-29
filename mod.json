@@ -1,0 +1,14 @@
+{
+  "name": "Mortal Dusk",
+  "folder": "phantombladezero_mortaldusk",
+  "author": "Kintaro",
+  "version": "1.4",
+  "description": "On the 66 Days difficulty a single death ends the run, and 66 Days is open from the first game.",
+  "kind": "ue4ss",
+  "game": "phantombladezero",
+  "gameFolder": "PBZ",
+  "win64Path": "platform\\steam",
+  "gameVersion": "CL-301524_JKS-17219",
+  "engine": "UE5_7",
+  "ue4ss": "v3.0.1-1183-gcdbc0b66"
+}
