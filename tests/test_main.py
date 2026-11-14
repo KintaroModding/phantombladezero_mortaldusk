@@ -1,17 +1,18 @@
 """Offline test of Scripts/main.lua with lupa (Lua 5.4) and small mocks of UE4SS and the game.
 
-The mocks stand in for the UE4SS functions that the script uses (LoopAsync, ExecuteInGameThread as a queue that runs
-after the current call, RegisterHook with a first and a post callback, RegisterLoadMapPostHook, StaticFindObject,
-FindAllOf, UEHelpers) and for the game: a clock (os.clock), the player controller and pawn (RemainingDays, health,
-RefreshMaterialParam), the function library's GetDiffcultMode, the game system's bCanSelectNightMare flag, and the
-two menus with their buttons (SetButtonText) and descriptions (they ignore SetText, like PBZCommonLocText). The game
-calls a hooked native function like UE4SS: first callback, then the function, then (when the test says so) the post
-callback.
+The mocks stand in for the UE4SS functions that the script uses (LoopInGameThreadWithDelay, LoopAsync,
+ExecuteInGameThread as a queue that runs after the current call, RegisterHook with a first and a post callback,
+RegisterLoadMapPostHook, StaticFindObject, FindAllOf, UEHelpers) and for the game: a clock (os.clock), the player
+controller and pawn (RemainingDays, health, RefreshMaterialParam), the function library's GetDiffcultMode, the game
+system's bCanSelectNightMare flag, and the two menus with their buttons (SetButtonText) and descriptions (they ignore
+SetText, like PBZCommonLocText). The game calls a hooked native function like UE4SS: first callback, then the
+function, then (when the test says so) the post callback.
 
 The settings checks run main.lua with the shipped Scripts/config.lua and with the files a player may have instead:
 none, an empty or older one, a broken one, one without a table, one with values of the wrong type, and one with a
 setting the mod does not know. main.lua must start without an error in each case, and a setting that the file does
-not give must keep its default. The shipped config.lua must hold exactly the defaults of main.lua.
+not give must keep its default. The shipped config.lua must hold exactly the defaults of main.lua. The live checks
+(1.5) rewrite config.lua while the mod runs, and one run takes LoopInGameThreadWithDelay away (the LoopAsync fallback).
 
 Usage:
     python tests/test_main.py        (needs lupa: python -m pip install lupa)
@@ -35,7 +36,7 @@ SET_BUTTON = "/Script/ProjectPBZ.PBZButtonBase:SetButtonText"
 SET_KEY = "/Script/ProjectPBZ.PBZCommonLocText:SetTextByLocKey"
 SET_FORMAT = "/Script/ProjectPBZ.PBZCommonLocText:SetPBZFormatText"
 ACTIVATE = "/Script/Engine.BlueprintAsyncActionBase:Activate"
-TIMERS = 2
+TIMERS = 3
 
 OLD_15 = "66 days only. Every step could be your last."
 OLD_16 = ('Same difficulty as "Hellwalker," but deaths are limited to 66 times. Unlocked after completing the game on '
@@ -191,7 +192,11 @@ function FLUSH()
     end
 end
 LOOPS = {}
-function LoopAsync(ms, callback) LOOPS[#LOOPS + 1] = callback end
+LOOP_MS = {}
+ASYNC = 0
+function LoopInGameThreadWithDelay(ms, callback) LOOPS[#LOOPS + 1] = callback LOOP_MS[#LOOP_MS + 1] = ms end
+-- The older loop (the fallback without LoopInGameThreadWithDelay): its callback hands the work to ExecuteInGameThread.
+function LoopAsync(ms, callback) ASYNC = ASYNC + 1 LOOPS[#LOOPS + 1] = callback LOOP_MS[#LOOP_MS + 1] = ms end
 function TICK() for i = 1, #LOOPS do LOOPS[i]() end FLUSH() end
 
 package.preload["UEHelpers"] = function()
@@ -232,11 +237,14 @@ def lua_long(text: str) -> str:
     return "[==[" + text + "]==]"
 
 
-def run(config_folder: Path, ticks: int = 3):
-    """Runs main.lua with require("config") reading config.lua in config_folder, and its timers. A Lua error that
-    stops main.lua becomes an "Error" line in the log, so the checks fail instead of the test."""
+def run(config_folder: Path, ticks: int = 3, before: str = ""):
+    """Runs main.lua with config.lua in config_folder (found through package.path), and its timers. Lua code in before
+    runs after the mocks (to take a UE4SS function away). A Lua error that stops main.lua becomes an "Error" line in
+    the log, so the checks fail instead of the test."""
     lua = lua54.LuaRuntime(unpack_returned_tuples=True)
     lua.execute(MOCKS)
+    if before:
+        lua.execute(before)
     lua.execute(f'package.path = {lua_path(config_folder)} .. "/?.lua"; package.cpath = ""')
     g = lua.globals()
     try:
@@ -270,7 +278,8 @@ def main() -> None:
     lua, g, log = run(CONFIG.parent)
     for line in log:
         print("      log: " + line)
-    check(len(g.LOOPS) == TIMERS, f"{TIMERS} LoopAsync timers (the day counter, the text check)")
+    check(len(g.LOOPS) == TIMERS and g.ASYNC == 0 and lua.eval("table.concat(LOOP_MS, ',')") == "250,500,5000",
+          "three game-thread loops (day counter 250 ms, text check 500 ms, config.lua 5 s), no LoopAsync")
     check(len(g.MAP_HOOKS) == 1, "one map load hook")
     check(len(list(g.HOOKS.keys())) == 4
           and all(g.HOOKS[p] is not None for p in (CAN_SELECT, SET_BUTTON, SET_KEY, ACTIVATE)),
@@ -423,6 +432,57 @@ def main() -> None:
         lua.execute(f"CLOCK = 110 FIND_ALL = 0 DIFF.Desc2.txt = {OLD_16!r} TICK() TICK() TICK()")
         check(g.FIND_ALL == 0 and g.DIFF.Desc2.txt == OLD_16, "during play (no hook for 3 s) the check runs no FindAllOf")
         check(not any("Error" in line for line in all_lines(g)), "no error line in the whole run")
+
+        # 1.5: config.lua read live.
+        live = Path(temp) / "live"
+        live.mkdir()
+        cfg = live / "config.lua"
+        cfg.write_text("return {}\n", encoding="utf-8")
+        lual, gl, logl = run(live)
+
+        def set_config(content):
+            """Writes config.lua; one timer run reads it (the config step runs last)."""
+            cfg.write_text(content, encoding="utf-8")
+            mark = len(gl.LOG)
+            lual.execute("TICK()")
+            return [gl.LOG[i].rstrip() for i in range(mark + 1, len(gl.LOG) + 1)]
+
+        def live_after(code):
+            mark = len(gl.LOG)
+            lual.execute(code)
+            return [gl.LOG[i].rstrip() for i in range(mark + 1, len(gl.LOG) + 1)]
+
+        quiet = gl.PAWN.RemainingDays == 1 and not any("days left" in line for line in logl)
+        lines = set_config("return { LogDusk = true }\n")
+        later = live_after("CLOCK = 10 PAWN.RemainingDays = 0 TICK()")
+        check(quiet and any("Settings: LogDusk=true" in line for line in lines)
+              and gl.PAWN.RemainingDays == 1 and any("days left 0 -> 1" in line for line in later),
+              "live: LogDusk turned on logs the day counter from the next run, with a new settings line")
+        lines = set_config("return {\n    LogDusk =\n")
+        later = live_after("CLOCK = 20 PAWN.RemainingDays = 0 TICK()")
+        check(any("the last settings stay" in line for line in lines)
+              and any("days left 0 -> 1" in line for line in later),
+              "live: a broken config.lua keeps the last settings (LogDusk stays on)")
+        lines = set_config("return { LogDusk = false }\n")
+        later = live_after("CLOCK = 30 PAWN.RemainingDays = 0 TICK()")
+        check(any("Settings: LogDusk=false" in line for line in lines)
+              and gl.PAWN.RemainingDays == 1 and not later,
+              "live: LogDusk turned off: the counter still goes back to 1, no more lines")
+        lines = set_config("return { LogDusk = false }\n")
+        check(not lines, "live: an unchanged config.lua logs nothing")
+        lines = set_config("-- a note\nreturn { LogDusk = false }\n")
+        check(not lines, "live: a new text with the same settings logs nothing")
+        check(not any("Error" in gl.LOG[i] for i in range(1, len(gl.LOG) + 1)), "no error line in the live run")
+
+        # 1.5: a UE4SS without the game-thread loops gets the older LoopAsync loops, and the log says so.
+        luaf, gf, logf = run(CONFIG.parent, before="LoopInGameThreadWithDelay = nil")
+        check(gf.ASYNC == 3 and len(gf.LOOPS) == 3 and any("the older LoopAsync is used" in line for line in logf)
+              and gf.PAWN.RemainingDays == 1 and not any("Error" in line for line in logf),
+              "without LoopInGameThreadWithDelay: three LoopAsync loops, one log line, the counter still at 1")
+        luaf.execute("for i = 1, #LOOPS do LOOPS[i]() end")
+        queued = luaf.eval("#QUEUE")
+        luaf.execute("FLUSH()")
+        check(queued == 3, "the LoopAsync fallback runs no step itself: each one goes to ExecuteInGameThread")
 
         # LogDusk off: no lines, the counter still works.
         lua4, g4, log4 = run(folders["LogDusk off"])

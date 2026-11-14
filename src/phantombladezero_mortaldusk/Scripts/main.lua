@@ -35,15 +35,20 @@
 -- LogDusk (for tests) logs the difficulty and the days of each player, each change of the counter, each death, each
 -- answer of the 66 Days check and each text change.
 --
--- Settings: the player edits Scripts\config.lua; DEFAULTS holds every setting with its default. A player (or a mod
--- manager) keeps their config.lua across updates, so a new main.lua can meet an older file: a setting that the file
--- lacks, or has with another type, keeps its default, and the log says so. Read a setting only from Settings, never
--- as `config.X or default`: for a true/false setting, `false or true` is true.
+-- Settings: the player edits Scripts\config.lua. The mod reads it at start and again every CONFIG_INTERVAL_MS (1.5),
+-- so a change shows without a restart; a broken or half-saved file keeps the last settings. DEFAULTS holds every
+-- setting with its default. A player (or a mod manager) keeps their config.lua across updates, so a new main.lua can
+-- meet an older file: a setting that the file lacks, or has with another type, keeps its default, and the log says so.
+-- Read a setting only from Settings, never as `config.X or default`: for a true/false setting, `false or true` is true.
+--
+-- 1.5: every loop runs on the game thread (LoopInGameThreadWithDelay; the older LoopAsync ran its callback on a second
+-- thread beside the hooks: Witch Time's crash lesson of 2026-10-31), and config.lua is read live.
 
 local UEHelpers = require("UEHelpers")
 
 local MOD_NAME = "Mortal Dusk"
-local VERSION = "1.4"
+local VERSION = "1.5"
+local CONFIG_INTERVAL_MS = 5000
 -- The check of the day counter.
 local CHECK_INTERVAL_MS = 250
 -- After the player's health was 0, the counter stays untouched this long.
@@ -113,29 +118,36 @@ local function LogError(message)
     end
 end
 
--- DEFAULTS, with the values of Scripts\config.lua over them.
-local function ReadSettings()
+local function CopyDefaults()
     local settings = {}
     for name, value in pairs(DEFAULTS) do
         settings[name] = value
     end
-    local ok, config = pcall(require, "config")
+    return settings
+end
+
+-- Lua's line number and reason, without the chunk name.
+local function Reason(message)
+    message = tostring(message)
+    local line, reason = message:match("config%.lua:(%d+): ([^\n]*)")
+    return line and ("line " .. line .. ": " .. reason) or (message:gsub("%s*\n%s*", " "))
+end
+
+-- DEFAULTS with the values of config.lua's text over them; nil and the reason when the text is not a usable file
+-- (1.5: from the file's text, so it can be read again; require would keep the first result).
+local function ParseConfig(text)
+    local chunk, problem = load(text, "=config.lua", "t", {})
+    if not chunk then
+        return nil, "config.lua not read (" .. Reason(problem) .. ")"
+    end
+    local ok, config = pcall(chunk)
     if not ok then
-        local message = tostring(config)
-        if message:find("module 'config' not found", 1, true) then
-            Log("No config.lua; every setting uses its default.")
-        else
-            -- A broken file: Lua's line number and reason, without the long file path.
-            local line, reason = message:match("config%.lua:(%d+): ([^\n]*)")
-            local detail = line and ("line " .. line .. ": " .. reason) or message:gsub("%s*\n%s*", " ")
-            Log("config.lua not read (" .. detail .. "); every setting uses its default.")
-        end
-        return settings
+        return nil, "config.lua not read (" .. Reason(config) .. ")"
     end
     if type(config) ~= "table" then
-        Log("config.lua does not return a table; every setting uses its default.")
-        return settings
+        return nil, "config.lua does not return a table"
     end
+    local settings = CopyDefaults()
     for name, value in pairs(config) do
         local default = DEFAULTS[name]
         if default == nil then
@@ -145,7 +157,7 @@ local function ReadSettings()
                 tostring(default)))
         else
             local limit = LIMITS[name]
-            if limit and (value < limit[1] or value > limit[2]) then
+            if limit and (value ~= value or value < limit[1] or value > limit[2]) then
                 Log(string.format("config.lua: %s must be from %s to %s; the default %s is used.", name,
                     tostring(limit[1]), tostring(limit[2]), tostring(default)))
             else
@@ -170,9 +182,57 @@ local function Describe(settings)
     return table.concat(parts, ", ")
 end
 
+local Settings = {}
+local configPath = nil
+-- The text of the last read; false: no file at the last read; nil: not read yet.
+local configText = nil
+
+-- Reads config.lua when its text changed since the last read. At start, a missing or broken file means the defaults;
+-- later, a broken file keeps the last settings (a half-saved file), and a missing one means the defaults.
+local function ReadConfig()
+    local atStart = configText == nil
+    configPath = configPath or package.searchpath("config", package.path)
+    local text = false
+    if configPath then
+        local file = io.open(configPath, "rb")
+        if file then
+            text = file:read("a") or false
+            file:close()
+        end
+    end
+    if text == configText then
+        return
+    end
+    configText = text
+    local settings, problem
+    if text == false then
+        settings, problem = CopyDefaults(), nil
+        Log("No config.lua; every setting uses its default.")
+    else
+        settings, problem = ParseConfig(text)
+    end
+    if not settings then
+        if atStart then
+            Log(problem .. "; every setting uses its default.")
+            settings = CopyDefaults()
+        else
+            Log(problem .. "; the last settings stay.")
+            return
+        end
+    end
+    local line = Describe(settings)
+    if atStart or line ~= Describe(Settings) then
+        Log("Settings: " .. line)
+    end
+    Settings = settings
+end
+
 Log(VERSION .. " loaded.")
-local Settings = ReadSettings()
-Log("Settings: " .. Describe(Settings))
+Settings = CopyDefaults()
+local read, readProblem = pcall(ReadConfig)
+if not read then
+    LogError("Error while reading config.lua: " .. tostring(readProblem))
+end
 
 -- Real time in seconds (wall time on Windows).
 local function Now()
@@ -565,23 +625,43 @@ RegisterLoadMapPostHook(function()
     lastPawnKey = nil
 end)
 
-LoopAsync(CHECK_INTERVAL_MS, function()
-    ExecuteInGameThread(function()
-        local ok, err = pcall(KeepDays)
-        if not ok then
-            LogError("Error in the day counter: " .. tostring(err))
-        end
-    end)
-    -- false keeps the loop running.
-    return false
-end)
+local function CheckStep()
+    local ok, err = pcall(KeepDays)
+    if not ok then
+        LogError("Error in the day counter: " .. tostring(err))
+    end
+end
 
-LoopAsync(TEXT_CHECK_MS, function()
-    ExecuteInGameThread(function()
-        local ok, err = pcall(CheckTexts)
-        if not ok then
-            LogError("Error in the text check: " .. tostring(err))
-        end
-    end)
-    return false
-end)
+local function TextStep()
+    local ok, err = pcall(CheckTexts)
+    if not ok then
+        LogError("Error in the text check: " .. tostring(err))
+    end
+end
+
+local function ConfigStep()
+    local ok, err = pcall(ReadConfig)
+    if not ok then
+        LogError("Error while reading config.lua: " .. tostring(err))
+    end
+end
+
+-- 1.5: every loop runs on the game thread (UE4SS's Delayed Action API): no Lua on a second thread beside the hooks
+-- (Witch Time's crash lesson). A UE4SS without it gets the old LoopAsync loops, and the log says so.
+if type(LoopInGameThreadWithDelay) == "function" then
+    LoopInGameThreadWithDelay(CHECK_INTERVAL_MS, CheckStep)
+    LoopInGameThreadWithDelay(TEXT_CHECK_MS, TextStep)
+    LoopInGameThreadWithDelay(CONFIG_INTERVAL_MS, ConfigStep)
+else
+    Log("This UE4SS has no game-thread loops (LoopInGameThreadWithDelay): the older LoopAsync is used; a newer UE4SS "
+        .. "is safer.")
+    local loops = { { CHECK_INTERVAL_MS, CheckStep }, { TEXT_CHECK_MS, TextStep }, { CONFIG_INTERVAL_MS, ConfigStep } }
+    for _, loop in ipairs(loops) do
+        local step = loop[2]
+        LoopAsync(loop[1], function()
+            ExecuteInGameThread(step)
+            -- false keeps the loop running.
+            return false
+        end)
+    end
+end

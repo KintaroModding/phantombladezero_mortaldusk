@@ -45,7 +45,8 @@ Start a new game and choose "MORTAL DUSK". Then do not die.
 ## Settings
 
 The settings are in `platform\steam\ue4ss\Mods\phantombladezero_mortaldusk\Scripts\config.lua`. Open it with a text editor, change
-a value, save, and start the game again. `UE4SS.log` shows the settings in use in the line
+a value and save: the mod reads the file every 5 seconds, so the game uses it without a restart. `UE4SS.log` shows
+the settings in use in the line
 `[Mortal Dusk] Settings: ...`, and names each value it could not use.
 
 | Setting | Default | What it does |
@@ -54,10 +55,12 @@ a value, save, and start the game again. `UE4SS.log` shows the settings in use i
 
 ## Compatibility
 
-- Game version: Release (Steam build 26266538) (`CL-301524_JKS-17219`).
-- Tested with UE4SS `v3.0.1-1183-gcdbc0b66`.
-- Made to work with Let's Die Again (its "CONTINUE" text then stays) and with 66 Days Unlocked (not needed with this
-  mod); neither pair is tested together yet.
+- Game version: Steam build 26367565 (`CL-302256_JKS-17280`).
+- Tested with UE4SS `v4.0.0`.
+- Made to work with [Let's Die Again!](https://github.com/KintaroModding/phantombladezero_letsdieagain) (its
+  "CONTINUE" text then stays) and with
+  [66 Days Unlocked](https://github.com/KintaroModding/phantombladezero_66daysunlocked) (not needed with this mod);
+  neither pair is tested together yet.
 
 ## Known issues
 
