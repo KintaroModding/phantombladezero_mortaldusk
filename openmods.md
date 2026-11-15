@@ -20,7 +20,7 @@ It is a UE4SS script; it changes no game file.
 
 ## Screenshots
 
-![Mortal Dusk](docs/cover.png)
+![Mortal Dusk](docs/cover.webp)
 
 ## How to install
 
